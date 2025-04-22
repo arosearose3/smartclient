@@ -1,0 +1,16 @@
+{
+  "name": "smart-on-fhir-client",
+  "version": "1.0.0",
+  "description": "SMART on FHIR client application",
+  "main": "smartclient.js",
+  "type": "module",
+  "scripts": {
+    "start": "node smartclient.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "ejs": "^3.1.9"
+  }
+}
