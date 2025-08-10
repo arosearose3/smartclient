@@ -10,20 +10,22 @@ import axios from 'axios';
 import { URL } from 'url';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import 'dotenv/config';
 
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Configuration
-const PORT = 3005;
-const CLIENT_ID = 'simpleclient_xwxa'; // Your registered client ID with localhost redirect URIs
-const SMART_SERVER_BASE = 'https://corisystem.org/onecred/smart';
-const FHIR_SERVER_BASE = 'https://corisystem.org/onecred/smart/fhir';
-const REDIRECT_URI = `http://localhost:${PORT}/smart/callback`;
+const PORT = Number(process.env.SMARTCLIENT_PORT) || 3005;
+const CLIENT_ID = process.env.SMART_CLIENT_ID || 'simpleclient_xwxa'; // Your registered client ID with localhost redirect URIs
+const SMART_SERVER_BASE = process.env.SMART_SERVER_BASE || 'https://corisystem.org/onecred/smart';
+const FHIR_SERVER_BASE = process.env.FHIR_SERVER_BASE || 'https://corisystem.org/onecred/smart/fhir';
+const REDIRECT_URI = process.env.SMART_REDIRECT_URI || `http://localhost:${PORT}/smart/callback`;
 
 // Create Express app
 const app = express();
+axios.defaults.timeout = 15000; // Add basic network resilience
 
 // Configure sessions for storing PKCE and state values
 app.use(session({
@@ -324,9 +326,12 @@ app.get('/launch', async (req, res) => {
       req.session.launchContext = launchContext;
     }
     
+    // Determine SMART discovery base from launch context (iss) or fallback to configured base
+    const smartBase = req.session.launchContext?.iss || SMART_SERVER_BASE;
+    req.session.smartBase = smartBase;
     // Fetch .well-known/smart-configuration to discover authorization endpoint
-    console.log('Fetching SMART configuration...');
-    const smartConfigResponse = await axios.get(`${SMART_SERVER_BASE}/.well-known/smart-configuration`);
+    console.log('Fetching SMART configuration from:', `${smartBase}/.well-known/smart-configuration`);
+    const smartConfigResponse = await axios.get(`${smartBase}/.well-known/smart-configuration`);
     const smartConfig = smartConfigResponse.data;
     console.log('SMART configuration:', smartConfig);
     
@@ -343,6 +348,10 @@ app.get('/launch', async (req, res) => {
     authUrl.searchParams.append('aud', FHIR_SERVER_BASE);
     authUrl.searchParams.append('code_challenge', codeChallenge);
     authUrl.searchParams.append('code_challenge_method', 'S256');
+    // Include EHR-provided launch context if present
+    if (req.session.launchContext?.launch) {
+      authUrl.searchParams.append('launch', req.session.launchContext.launch);
+    }
     
     // Redirect to authorization server
     console.log(`Redirecting to authorization endpoint: ${authUrl.toString()}`);
@@ -353,8 +362,8 @@ app.get('/launch', async (req, res) => {
   }
 });
 
-// OAuth Callback
-app.get('/smart/callback', async (req, res) => {
+// OAuth Callback (support both paths)
+app.get(['/smart/callback', '/callback'], async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
     
@@ -375,7 +384,8 @@ app.get('/smart/callback', async (req, res) => {
     }
     
     // Fetch .well-known/smart-configuration to discover token endpoint
-    const smartConfigResponse = await axios.get(`${SMART_SERVER_BASE}/.well-known/smart-configuration`);
+    const smartBase = req.session.smartBase || SMART_SERVER_BASE;
+    const smartConfigResponse = await axios.get(`${smartBase}/.well-known/smart-configuration`);
     const tokenEndpoint = smartConfigResponse.data.token_endpoint;
     
     console.log(`Exchanging authorization code for token at ${tokenEndpoint}`);
@@ -394,18 +404,33 @@ app.get('/smart/callback', async (req, res) => {
     });
     
     const tokenData = tokenResponse.data;
-    console.log('Token response:', tokenData);
+    // Redact secrets in logs
+    const redacted = { ...tokenData };
+    if (redacted.access_token) redacted.access_token = `[redacted:${String(tokenData.access_token).slice(0,6)}…]`;
+    if (redacted.refresh_token) redacted.refresh_token = `[redacted:${String(tokenData.refresh_token).slice(0,6)}…]`;
+    if (redacted.id_token) redacted.id_token = '[redacted:jwt]';
+    console.log('Token response:', redacted);
     
     // Use the token to fetch Practitioner data and related resources
     let practitionerData = null;
     let fhirUserData = null;
     let practitionerRoles = [];
     let organizations = [];
+    // Will hold SMART config and userinfo for downstream context
+    let smartConfigData = null;
+    let userInfoData = null;
     
     if (tokenData.access_token) {
       try {
-        // Extract the practitioner ID from the token response
-        const practitionerId = tokenData.practitioner;
+        // Resolve Practitioner ID from token
+        const extractPractitionerId = (val) => {
+          if (!val) return null;
+          const s = String(val);
+          const parts = s.split('/');
+          return parts.length > 1 ? parts.pop() : s;
+        };
+        // Prefer explicit practitioner claim; otherwise derive from fhirUser (absolute or relative)
+        let practitionerId = extractPractitionerId(tokenData.practitioner || tokenData.fhirUser);
         
         if (practitionerId) {
           console.log(`Fetching Practitioner data for ID: ${practitionerId}`);
@@ -421,64 +446,185 @@ app.get('/smart/callback', async (req, res) => {
           practitionerData = practitionerResponse.data;
           console.log('Successfully fetched practitioner data');
           
-          // Try fetching PractitionerRole resources
+          // Fetch SMART config + userinfo first to gather context, then fetch PractitionerRole/Organization
           try {
-            console.log(`Fetching PractitionerRole resources for practitioner: ${practitionerId}`);
-            const practitionerRoleResponse = await axios.get(
-              `${FHIR_SERVER_BASE}/PractitionerRole?practitioner=${practitionerId}`,
-              {
-                headers: {
-                  'Authorization': `Bearer ${tokenData.access_token}`,
-                  'Accept': 'application/json'
-                }
-              }
-            );
-            
-            if (practitionerRoleResponse.data && practitionerRoleResponse.data.entry) {
-              practitionerRoles = practitionerRoleResponse.data.entry.map(entry => entry.resource);
-              console.log(`Found ${practitionerRoles.length} PractitionerRole resources`);
-              
-              // Extract unique organization references
-              const orgReferences = [];
-              practitionerRoles.forEach(role => {
-                if (role.organization && role.organization.reference) {
-                  const orgRef = role.organization.reference;
-                  if (!orgReferences.includes(orgRef)) {
-                    orgReferences.push(orgRef);
-                  }
-                }
-              });
-              
-              // Fetch each organization
-              for (const orgRef of orgReferences) {
-                const orgId = orgRef.split('/').pop();
-                try {
-                  console.log(`Fetching organization: ${orgId}`);
-                  const orgResponse = await axios.get(
-                    `${FHIR_SERVER_BASE}/Organization/${orgId}`,
-                    {
-                      headers: {
-                        'Authorization': `Bearer ${tokenData.access_token}`,
-                        'Accept': 'application/json'
-                      }
-                    }
-                  );
-                  
-                  if (orgResponse.data) {
-                    organizations.push(orgResponse.data);
-                  }
-                } catch (orgError) {
-                  console.log(`Error fetching organization ${orgId}: ${orgError.message}`);
-                  if (orgError.response) {
-                    console.log(`Status: ${orgError.response.status}, Data: ${JSON.stringify(orgError.response.data).substring(0, 100)}...`);
-                  }
-                }
-              }
-              
-              console.log(`Fetched ${organizations.length} organizations`);
+            const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== '');
+            const extractId = (val) => {
+              if (!val) return null;
+              const s = String(val);
+              const parts = s.split('/');
+              return parts.length > 1 ? parts.pop() : s;
+            };
+
+            // 0) Fetch SMART configuration and userinfo to enrich context
+            try {
+              console.log('Fetching SMART configuration for context from:', `${smartBase}/.well-known/smart-configuration`);
+              const scResp = await axios.get(`${smartBase}/.well-known/smart-configuration`);
+              smartConfigData = scResp.data;
+            } catch (cfgErr) {
+              console.log(`Error fetching SMART configuration: ${cfgErr.message}`);
             }
+            if (smartConfigData?.userinfo_endpoint) {
+              try {
+                console.log('Fetching user info');
+                const uiResp = await axios.get(smartConfigData.userinfo_endpoint, {
+                  headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+                });
+                userInfoData = uiResp.data;
+              } catch (uiErr) {
+                console.log(`Error fetching user info: ${uiErr.message}`);
+              }
+            }
+
+            // Log context from CORI host (launch params, userinfo, token minus secrets)
+            try {
+              const tokenContextLog = { ...tokenData };
+              delete tokenContextLog.access_token;
+              delete tokenContextLog.refresh_token;
+              delete tokenContextLog.id_token;
+              console.log('Launch context (session):', req.session.launchContext || {});
+              console.log('Userinfo context:', userInfoData || {});
+              console.log('Token context (redacted):', tokenContextLog);
+            } catch (_) {}
+
+            const getContextValue = (keys) => {
+              for (const k of keys) {
+                if (tokenData && tokenData[k]) return tokenData[k];
+                if (userInfoData && userInfoData[k]) return userInfoData[k];
+                if (req.session.launchContext && req.session.launchContext[k]) return req.session.launchContext[k];
+              }
+              return null;
+            };
+
+            // 1) PractitionerRole: prefer direct ID from token/context; fallback to practitioner search
+            const practitionerRoleIdRaw = pick(
+              getContextValue(['practitionerRole', 'practitionerRoleId', 'role', 'roleId', 'practitioner_role_id']),
+              tokenData?.fhirUser?.includes('PractitionerRole/') ? tokenData.fhirUser : null
+            );
+            const practitionerRoleId = extractId(practitionerRoleIdRaw);
+            practitionerRoles = [];
+            console.log(`Context PractitionerRole ID: ${practitionerRoleId || 'none'}`);
+
+            if (practitionerRoleId) {
+              // Prefer _id search per CORI proxy expectations
+              const prRoleIdSearchUrl = `${FHIR_SERVER_BASE}/PractitionerRole?_id=${encodeURIComponent(practitionerRoleId)}`;
+              console.log(`Searching PractitionerRole by _id: ${prRoleIdSearchUrl}`);
+              try {
+                const prIdSearchResp = await axios.get(prRoleIdSearchUrl, {
+                  headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+                });
+                practitionerRoles = (prIdSearchResp.data?.entry || [])
+                  .map(e => e.resource)
+                  .filter(r => r && r.resourceType === 'PractitionerRole');
+              } catch (idSearchErr) {
+                console.log(`PractitionerRole _id search failed: ${idSearchErr.message}`);
+                if (idSearchErr.response) console.log(`Status: ${idSearchErr.response.status}, Data: ${idSearchErr.response.data}`);
+                // Fallback to read-by-id
+                const prRoleReadUrl = `${FHIR_SERVER_BASE}/PractitionerRole/${encodeURIComponent(practitionerRoleId)}`;
+                console.log(`Falling back to PractitionerRole read-by-id: ${prRoleReadUrl}`);
+                try {
+                  const prRoleReadResp = await axios.get(prRoleReadUrl, {
+                    headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+                  });
+                  if (prRoleReadResp.data?.resourceType === 'PractitionerRole') {
+                    practitionerRoles = [prRoleReadResp.data];
+                  }
+                } catch (readErr) {
+                  console.log(`PractitionerRole read-by-id failed: ${readErr.message}`);
+                  if (readErr.response) console.log(`Status: ${readErr.response.status}, Data: ${readErr.response.data}`);
+                }
+              }
+            }
+
+            if (practitionerRoles.length === 0) {
+              // Fallback search by practitioner reference
+              const practitionerRef = `Practitioner/${practitionerId}`;
+              const prRoleSearchUrl = `${FHIR_SERVER_BASE}/PractitionerRole?practitioner=${encodeURIComponent(practitionerRef)}`;
+              console.log(`Searching PractitionerRole by practitioner: ${prRoleSearchUrl}`);
+              try {
+                const practitionerRoleResponse = await axios.get(prRoleSearchUrl, {
+                  headers: {
+                    'Authorization': `Bearer ${tokenData.access_token}`,
+                    'Accept': 'application/json'
+                  }
+                });
+                practitionerRoles = (practitionerRoleResponse.data?.entry || [])
+                  .map(e => e.resource)
+                  .filter(r => r && r.resourceType === 'PractitionerRole');
+              } catch (searchErr) {
+                console.log(`PractitionerRole search failed: ${searchErr.message}`);
+                if (searchErr.response) console.log(`Status: ${searchErr.response.status}, Data: ${searchErr.response.data}`);
+              }
+            }
+
+            // 2) Organizations: start with any organization id from token/context
+            const organizationIdRaw = pick(
+              getContextValue(['organization', 'organizationId', 'org', 'orgId', 'organization_id'])
+            );
+            const organizationId = extractId(organizationIdRaw);
+
+            const orgMap = new Map();
+            // Log the derived IDs for visibility
+            try {
+              console.log('Derived context IDs:', { practitionerId, practitionerRoleId, organizationId });
+            } catch (_) {}
+            if (organizationId) {
+              const orgUrl = `${FHIR_SERVER_BASE}/Organization/${encodeURIComponent(organizationId)}`;
+              console.log(`Fetching Organization by id: ${orgUrl}`);
+              try {
+                const orgResp = await axios.get(orgUrl, {
+                  headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+                });
+                if (orgResp.data?.resourceType === 'Organization') {
+                  orgMap.set(orgResp.data.id, orgResp.data);
+                }
+              } catch (orgErr) {
+                console.log(`Organization read-by-id failed: ${orgErr.message}`);
+                if (orgErr.response) console.log(`Status: ${orgErr.response.status}, Data: ${orgErr.response.data}`);
+              }
+            } else {
+              console.log('No Organization ID found in token/userinfo/launch context');
+            }
+
+            // Also collect any organization references from roles
+            const orgRefs = new Set();
+            for (const role of practitionerRoles) {
+              const ref = role?.organization?.reference;
+              if (ref) orgRefs.add(ref);
+            }
+
+            const orgResponses = await Promise.all(Array.from(orgRefs).map(async (ref) => {
+              try {
+                // Normalize to CORI base
+                let url = '';
+                if (ref.startsWith('http')) {
+                  const parts = ref.split('/');
+                  const id = parts.pop();
+                  const type = parts.pop();
+                  url = `${FHIR_SERVER_BASE}/${type}/${id}`;
+                } else if (ref.includes('/')) {
+                  url = `${FHIR_SERVER_BASE}/${ref}`;
+                } else {
+                  url = `${FHIR_SERVER_BASE}/Organization/${ref}`;
+                }
+                const resp = await axios.get(url, {
+                  headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+                });
+                return resp.data;
+              } catch (e) {
+                console.log(`Failed to fetch Organization ${ref}: ${e.message}`);
+                return null;
+              }
+            }));
+
+            for (const org of orgResponses.filter(Boolean)) {
+              if (org?.resourceType === 'Organization' && org.id) orgMap.set(org.id, org);
+            }
+
+            organizations = Array.from(orgMap.values());
+            console.log(`Collected ${practitionerRoles.length} PractitionerRole and ${organizations.length} Organization resources`);
           } catch (roleError) {
-            console.log(`Error fetching PractitionerRole resources: ${roleError.message}`);
+            console.log(`Error fetching PractitionerRole/Organization: ${roleError.message}`);
             if (roleError.response) {
               console.log(`Status: ${roleError.response.status}, Data: ${roleError.response.data}`);
             }
@@ -539,8 +685,7 @@ app.get('/smart/callback', async (req, res) => {
           practitionerData._formatted = practitionerInfo;
         }
         
-        // If fhirUser claim is present, fetch that resource too
-        // Extract context information from token response
+        // Extract context information (token data + previously fetched SMART config and userinfo)
         console.log('Extracting context data');
         
         // Create an object to store all context data
@@ -560,32 +705,14 @@ app.get('/smart/callback', async (req, res) => {
           }
         });
         
-        // Try to get system context information
-        try {
-          console.log('Fetching SMART configuration');
-          const smartConfigResponse = await axios.get(`${SMART_SERVER_BASE}/.well-known/smart-configuration`);
-          fhirUserData.context.system.smartConfiguration = smartConfigResponse.data;
-        } catch (error) {
-          console.log(`Error fetching SMART configuration: ${error.message}`);
+        // Attach SMART configuration if available
+        if (smartConfigData) {
+          fhirUserData.context.system.smartConfiguration = smartConfigData;
         }
         
         // Try to access userinfo endpoint if available
-        if (fhirUserData.context.system.smartConfiguration?.userinfo_endpoint) {
-          try {
-            console.log('Fetching user info');
-            const userInfoResponse = await axios.get(
-              fhirUserData.context.system.smartConfiguration.userinfo_endpoint,
-              {
-                headers: {
-                  'Authorization': `Bearer ${tokenData.access_token}`,
-                  'Accept': 'application/json'
-                }
-              }
-            );
-            fhirUserData.context.user.userInfo = userInfoResponse.data;
-          } catch (error) {
-            console.log(`Error fetching user info: ${error.message}`);
-          }
+        if (userInfoData) {
+          fhirUserData.context.user.userInfo = userInfoData;
         }
         
         // Add launch parameters if they exist
