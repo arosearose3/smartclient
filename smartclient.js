@@ -19,8 +19,7 @@ const __dirname = path.dirname(__filename);
 // Configuration
 const PORT = Number(process.env.SMARTCLIENT_PORT) || 3005;
 const CLIENT_ID = process.env.SMART_CLIENT_ID || 'simpleclient_xwxa'; // Your registered client ID with localhost redirect URIs
-const SMART_SERVER_BASE = process.env.SMART_SERVER_BASE || 'https://corisystem.org/onecred/smart';
-const FHIR_SERVER_BASE = process.env.FHIR_SERVER_BASE || 'https://corisystem.org/onecred/smart/fhir';
+const DEFAULT_FHIR_BASE = process.env.DEFAULT_FHIR_BASE || '';
 const REDIRECT_URI = process.env.SMART_REDIRECT_URI || `http://localhost:${PORT}/smart/callback`;
 
 // Create Express app
@@ -326,13 +325,29 @@ app.get('/launch', async (req, res) => {
       req.session.launchContext = launchContext;
     }
     
-    // Determine SMART discovery base from launch context (iss) or fallback to configured base
-    const smartBase = req.session.launchContext?.iss || SMART_SERVER_BASE;
-    req.session.smartBase = smartBase;
-    // Fetch .well-known/smart-configuration to discover authorization endpoint
-    console.log('Fetching SMART configuration from:', `${smartBase}/.well-known/smart-configuration`);
-    const smartConfigResponse = await axios.get(`${smartBase}/.well-known/smart-configuration`);
-    const smartConfig = smartConfigResponse.data;
+    // Determine FHIR base (iss) from launch context or fallback to optional default
+    const fhirBaseCandidate = (req.session.launchContext?.iss || DEFAULT_FHIR_BASE || '').replace(/\/+$/, '');
+    if (!fhirBaseCandidate) {
+      throw new Error('No FHIR base (iss) provided. Supply ?iss=<FHIR base> in the launch request or set DEFAULT_FHIR_BASE in the environment.');
+    }
+    // Heuristic: if iss doesn't include /fhir, CORI proxy convention uses /fhir for FHIR endpoints
+    const fhirBase = fhirBaseCandidate.endsWith('/fhir') ? fhirBaseCandidate : `${fhirBaseCandidate}/fhir`;
+    req.session.fhirBase = fhirBase;
+    // Fetch .well-known/smart-configuration from the FHIR base (fallback to SMART root if needed)
+    const fetchSmartConfigFor = async (base) => {
+      const primaryUrl = `${base}/.well-known/smart-configuration`;
+      try {
+        console.log('Fetching SMART configuration from:', primaryUrl);
+        return (await axios.get(primaryUrl)).data;
+      } catch (e) {
+        const altBase = base.replace(/\/(fhir)$/,'');
+        const altUrl = `${altBase}/.well-known/smart-configuration`;
+        console.log(`Primary SMART config fetch failed (${e.message}). Trying fallback: ${altUrl}`);
+        return (await axios.get(altUrl)).data;
+      }
+    };
+    const smartConfig = await fetchSmartConfigFor(fhirBase);
+    req.session.smartConfig = smartConfig;
     console.log('SMART configuration:', smartConfig);
     
     // Construct authorization URL
@@ -345,7 +360,7 @@ app.get('/launch', async (req, res) => {
     authUrl.searchParams.append('redirect_uri', REDIRECT_URI);
     authUrl.searchParams.append('scope', 'launch openid fhirUser user/*.rs');
     authUrl.searchParams.append('state', state);
-    authUrl.searchParams.append('aud', FHIR_SERVER_BASE);
+    authUrl.searchParams.append('aud', fhirBase);
     authUrl.searchParams.append('code_challenge', codeChallenge);
     authUrl.searchParams.append('code_challenge_method', 'S256');
     // Include EHR-provided launch context if present
@@ -383,10 +398,26 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
       throw new Error('Code verifier not found in session');
     }
     
-    // Fetch .well-known/smart-configuration to discover token endpoint
-    const smartBase = req.session.smartBase || SMART_SERVER_BASE;
-    const smartConfigResponse = await axios.get(`${smartBase}/.well-known/smart-configuration`);
-    const tokenEndpoint = smartConfigResponse.data.token_endpoint;
+    // Fetch .well-known/smart-configuration (from FHIR base) to discover token endpoint
+    const fhirBaseCandidateCb = (req.session.fhirBase || DEFAULT_FHIR_BASE || '').replace(/\/+$/, '');
+    if (!fhirBaseCandidateCb) {
+      throw new Error('Missing FHIR base (iss) in session and no DEFAULT_FHIR_BASE configured');
+    }
+    const fhirBase = fhirBaseCandidateCb.endsWith('/fhir') ? fhirBaseCandidateCb : `${fhirBaseCandidateCb}/fhir`;
+    console.log(`Using FHIR base: ${fhirBase}`);
+    const smartConfig = req.session.smartConfig || (async () => {
+      const primaryUrl = `${fhirBase}/.well-known/smart-configuration`;
+      try {
+        console.log('Fetching SMART configuration from:', primaryUrl);
+        return (await axios.get(primaryUrl)).data;
+      } catch (e) {
+        const altBase = fhirBase.replace(/\/(fhir)$/,'');
+        const altUrl = `${altBase}/.well-known/smart-configuration`;
+        console.log(`Primary SMART config fetch failed (${e.message}). Trying fallback: ${altUrl}`);
+        return (await axios.get(altUrl)).data;
+      }
+    })();
+    const tokenEndpoint = smartConfig.token_endpoint;
     
     console.log(`Exchanging authorization code for token at ${tokenEndpoint}`);
     
@@ -421,6 +452,10 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
     let userInfoData = null;
     
     if (tokenData.access_token) {
+      // Always use the normalized fhirBase for resource requests (CORI proxy)
+      // fhirUser may point to an external store and the token may not be valid there.
+      const resourceBase = fhirBase;
+      console.log(`Using FHIR resource base: ${resourceBase}`);
       try {
         // Resolve Practitioner ID from token
         const extractPractitionerId = (val) => {
@@ -435,8 +470,8 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
         if (practitionerId) {
           console.log(`Fetching Practitioner data for ID: ${practitionerId}`);
           
-          // Use the SMART server's FHIR proxy to fetch the practitioner
-          const practitionerResponse = await axios.get(`${FHIR_SERVER_BASE}/Practitioner/${practitionerId}`, {
+          // Use the FHIR base discovered from launch to fetch the practitioner
+          const practitionerResponse = await axios.get(`${resourceBase}/Practitioner/${practitionerId}`, {
             headers: {
               'Authorization': `Bearer ${tokenData.access_token}`,
               'Accept': 'application/json'
@@ -458,8 +493,8 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
 
             // 0) Fetch SMART configuration and userinfo to enrich context
             try {
-              console.log('Fetching SMART configuration for context from:', `${smartBase}/.well-known/smart-configuration`);
-              const scResp = await axios.get(`${smartBase}/.well-known/smart-configuration`);
+              console.log('Fetching SMART configuration for context from:', `${fhirBase}/.well-known/smart-configuration`);
+              const scResp = await axios.get(`${fhirBase}/.well-known/smart-configuration`);
               smartConfigData = scResp.data;
             } catch (cfgErr) {
               console.log(`Error fetching SMART configuration: ${cfgErr.message}`);
@@ -507,7 +542,7 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
 
             if (practitionerRoleId) {
               // Prefer _id search per CORI proxy expectations
-              const prRoleIdSearchUrl = `${FHIR_SERVER_BASE}/PractitionerRole?_id=${encodeURIComponent(practitionerRoleId)}`;
+              const prRoleIdSearchUrl = `${resourceBase}/PractitionerRole?_id=${encodeURIComponent(practitionerRoleId)}`;
               console.log(`Searching PractitionerRole by _id: ${prRoleIdSearchUrl}`);
               try {
                 const prIdSearchResp = await axios.get(prRoleIdSearchUrl, {
@@ -520,7 +555,7 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
                 console.log(`PractitionerRole _id search failed: ${idSearchErr.message}`);
                 if (idSearchErr.response) console.log(`Status: ${idSearchErr.response.status}, Data: ${idSearchErr.response.data}`);
                 // Fallback to read-by-id
-                const prRoleReadUrl = `${FHIR_SERVER_BASE}/PractitionerRole/${encodeURIComponent(practitionerRoleId)}`;
+                const prRoleReadUrl = `${resourceBase}/PractitionerRole/${encodeURIComponent(practitionerRoleId)}`;
                 console.log(`Falling back to PractitionerRole read-by-id: ${prRoleReadUrl}`);
                 try {
                   const prRoleReadResp = await axios.get(prRoleReadUrl, {
@@ -539,7 +574,7 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
             if (practitionerRoles.length === 0) {
               // Fallback search by practitioner reference
               const practitionerRef = `Practitioner/${practitionerId}`;
-              const prRoleSearchUrl = `${FHIR_SERVER_BASE}/PractitionerRole?practitioner=${encodeURIComponent(practitionerRef)}`;
+              const prRoleSearchUrl = `${resourceBase}/PractitionerRole?practitioner=${encodeURIComponent(practitionerRef)}`;
               console.log(`Searching PractitionerRole by practitioner: ${prRoleSearchUrl}`);
               try {
                 const practitionerRoleResponse = await axios.get(prRoleSearchUrl, {
@@ -569,7 +604,7 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
               console.log('Derived context IDs:', { practitionerId, practitionerRoleId, organizationId });
             } catch (_) {}
             if (organizationId) {
-              const orgUrl = `${FHIR_SERVER_BASE}/Organization/${encodeURIComponent(organizationId)}`;
+              const orgUrl = `${resourceBase}/Organization/${encodeURIComponent(organizationId)}`;
               console.log(`Fetching Organization by id: ${orgUrl}`);
               try {
                 const orgResp = await axios.get(orgUrl, {
@@ -595,17 +630,17 @@ app.get(['/smart/callback', '/callback'], async (req, res) => {
 
             const orgResponses = await Promise.all(Array.from(orgRefs).map(async (ref) => {
               try {
-                // Normalize to CORI base
+                // Normalize to the discovered FHIR resource base
                 let url = '';
                 if (ref.startsWith('http')) {
                   const parts = ref.split('/');
                   const id = parts.pop();
                   const type = parts.pop();
-                  url = `${FHIR_SERVER_BASE}/${type}/${id}`;
+                  url = `${resourceBase}/${type}/${id}`;
                 } else if (ref.includes('/')) {
-                  url = `${FHIR_SERVER_BASE}/${ref}`;
+                  url = `${resourceBase}/${ref}`;
                 } else {
-                  url = `${FHIR_SERVER_BASE}/Organization/${ref}`;
+                  url = `${resourceBase}/Organization/${ref}`;
                 }
                 const resp = await axios.get(url, {
                   headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }

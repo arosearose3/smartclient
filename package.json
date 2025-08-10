@@ -8,8 +8,8 @@
   "scripts": {
     "start": "node smartclient.js",
     "dev": "nodemon --watch smartclient.js smartclient.js",
-    "start:inferno": "SMART_CLIENT_ID=simpleclient_xwxa SMART_SERVER_BASE=https://corisystem.org/onecred/smart FHIR_SERVER_BASE=https://corisystem.org/onecred/smart/fhir SMARTCLIENT_PORT=3005 SMART_REDIRECT_URI=http://localhost:3005/smart/callback node smartclient.js",
-    "start:local": "SMART_CLIENT_ID=simpleclient_xwxa SMART_SERVER_BASE=http://localhost:3001/smart FHIR_SERVER_BASE=http://localhost:3001/smart/fhir SMARTCLIENT_PORT=3005 SMART_REDIRECT_URI=http://localhost:3005/smart/callback node smartclient.js"
+    "start:inferno": "SMART_CLIENT_ID=simpleclient_xwxa DEFAULT_FHIR_BASE=https://corisystem.org/onecred/smart/fhir SMARTCLIENT_PORT=3005 SMART_REDIRECT_URI=http://localhost:3005/smart/callback node smartclient.js",
+    "start:local": "SMART_CLIENT_ID=simpleclient_xwxa DEFAULT_FHIR_BASE=http://localhost:3001/smart/fhir SMARTCLIENT_PORT=3005 SMART_REDIRECT_URI=http://localhost:3005/smart/callback node smartclient.js"
   },
   "dependencies": {
     "axios": "^1.6.2",
